@@ -40,6 +40,8 @@ public final class StartActivity extends Activity {
     }
 
     private void startTorchService() {
+        getSharedPreferences("light_settings", MODE_PRIVATE).edit()
+                .putBoolean("always_active", true).apply();
         Intent intent = new Intent(this, TorchService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
         else startService(intent);
