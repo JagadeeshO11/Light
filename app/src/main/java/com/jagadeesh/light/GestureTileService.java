@@ -15,7 +15,9 @@ public final class GestureTileService extends TileService {
     @Override public void onClick() {
         super.onClick();
         if (TorchService.isRunning()) {
-            stopService(new Intent(this, TorchService.class));
+            Intent stop = new Intent(this, TorchService.class).setAction("STOP");
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(stop);
+            else startService(stop);
             Tile tile = getQsTile();
             if (tile != null) {
                 tile.setState(Tile.STATE_INACTIVE);
