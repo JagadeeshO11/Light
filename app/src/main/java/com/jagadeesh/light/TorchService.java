@@ -18,11 +18,13 @@ import android.os.SystemClock;
 public final class TorchService extends Service implements SensorEventListener {
     private static final String CHANNEL = "light_gesture";
     private static final int NOTIFICATION_ID = 7;
-    private static final long MIN_PEAK_GAP_MS = 180;
-    private static final long MAX_PEAK_GAP_MS = 850;
-    private static final long COOLDOWN_MS = 1400;
-    private static final float PEAK_THRESHOLD = 11.5f;
-    private static final float REARM_THRESHOLD = 5.5f;
+
+    // Tuned for a lighter, quicker two-chop gesture.
+    private static final long MIN_PEAK_GAP_MS = 90;
+    private static final long MAX_PEAK_GAP_MS = 650;
+    private static final long COOLDOWN_MS = 650;
+    private static final float PEAK_THRESHOLD = 7.0f;
+    private static final float REARM_THRESHOLD = 3.0f;
 
     private SensorManager sensors;
     private Sensor accelerometer;
@@ -49,7 +51,8 @@ public final class TorchService extends Service implements SensorEventListener {
         }
         createChannel();
         startForeground(NOTIFICATION_ID, buildNotification());
-        if (accelerometer != null) sensors.registerListener(this, accelerometer, 40_000);
+        // 20 ms sampling gives the detector quicker response than the previous 40 ms.
+        if (accelerometer != null) sensors.registerListener(this, accelerometer, 20_000);
         if (proximity != null) sensors.registerListener(this, proximity, SensorManager.SENSOR_DELAY_NORMAL);
     }
 
@@ -98,11 +101,11 @@ public final class TorchService extends Service implements SensorEventListener {
 
         long gap = now - firstPeakAt;
         float directionDot = nx * firstX + ny * firstY + nz * firstZ;
-        if (gap >= MIN_PEAK_GAP_MS && gap <= MAX_PEAK_GAP_MS && directionDot < -0.30f) {
+        if (gap >= MIN_PEAK_GAP_MS && gap <= MAX_PEAK_GAP_MS && directionDot < -0.20f) {
             resetGesture();
             lastTriggerAt = now;
             toggleTorch();
-        } else if (gap > MAX_PEAK_GAP_MS || directionDot >= -0.30f) {
+        } else if (gap > MAX_PEAK_GAP_MS || directionDot >= -0.20f) {
             storeFirstPeak(now, nx, ny, nz);
         }
     }
