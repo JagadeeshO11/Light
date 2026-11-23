@@ -80,11 +80,18 @@ public final class TorchService extends Service implements SensorEventListener {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && "STOP".equals(intent.getAction())) {
+            getSharedPreferences("light_settings", MODE_PRIVATE).edit()
+                    .putBoolean("always_active", false).apply();
             setTorch(false);
             stopSelf();
             return START_NOT_STICKY;
         }
-        return START_STICKY;
+        if (intent != null && "UPDATE_NOTIFICATION".equals(intent.getAction())) {
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) manager.notify(NOTIFICATION_ID, buildNotification());
+        }
+        return getSharedPreferences("light_settings", MODE_PRIVATE)
+                .getBoolean("always_active", true) ? START_STICKY : START_NOT_STICKY;
     }
 
     @Override public void onSensorChanged(SensorEvent event) {
@@ -202,11 +209,18 @@ public final class TorchService extends Service implements SensorEventListener {
         PendingIntent pending = PendingIntent.getService(this, 8, stop, flags);
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+        boolean always = getSharedPreferences("light_settings", MODE_PRIVATE)
+                .getBoolean("always_active", true);
+        Intent mode = new Intent(this, AlwaysActiveReceiver.class).setAction("DISABLE_ALWAYS");
+        PendingIntent modePending = PendingIntent.getBroadcast(this, 9, mode, flags);
         return builder.setSmallIcon(android.R.drawable.ic_lock_idle_charging)
                 .setContentTitle("Light gesture active")
-                .setContentText("Double-chop to toggle flashlight")
+                .setContentText(always ? "Double-chop ready • Auto-start after reboot ON"
+                        : "Double-chop ready • Auto-start OFF")
                 .setOngoing(true).setOnlyAlertOnce(true)
                 .addAction(android.R.drawable.ic_media_pause, "Stop", pending)
+                .addAction(android.R.drawable.ic_lock_idle_alarm,
+                        always ? "Disable auto-start" : "Auto-start off", modePending)
                 .build();
     }
 
