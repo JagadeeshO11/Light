@@ -10,50 +10,72 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.SystemClock;
+import android.util.Log;
 
 public final class TorchService extends Service implements SensorEventListener {
+    private static final String TAG = "LightGesture";
     private static final String CHANNEL = "light_gesture";
     private static final int NOTIFICATION_ID = 7;
+    private static final float PEAK_THRESHOLD = 8.0f;
+    private static final float RELEASE_THRESHOLD = 2.4f;
+    private static final float OPPOSITE_DOT_THRESHOLD = -0.45f;
+    private static final long MIN_PEAK_GAP_MS = 110;
+    private static final long MAX_PEAK_GAP_MS = 560;
+    private static final long COOLDOWN_MS = 700;
 
-    // Tuned for a lighter, quicker two-chop gesture.
-    private static final long MIN_PEAK_GAP_MS = 90;
-    private static final long MAX_PEAK_GAP_MS = 650;
-    private static final long COOLDOWN_MS = 650;
-    private static final float PEAK_THRESHOLD = 7.0f;
-    private static final float REARM_THRESHOLD = 3.0f;
-
+    private static volatile boolean running;
     private SensorManager sensors;
-    private Sensor accelerometer;
-    private Sensor proximity;
+    private Sensor motionSensor;
+    private boolean linearAcceleration;
     private CameraManager camera;
     private String cameraId;
     private boolean torchOn;
-    private boolean peakArmed = true;
+    private boolean armed = true;
     private boolean pocketed;
     private long firstPeakAt;
     private long lastTriggerAt;
+    private long belowReleaseSince;
     private float firstX, firstY, firstZ;
     private float gravityX, gravityY, gravityZ;
     private boolean gravityReady;
 
+    private final CameraManager.TorchCallback torchCallback = new CameraManager.TorchCallback() {
+        @Override public void onTorchModeChanged(String id, boolean enabled) {
+            if (cameraId == null || cameraId.equals(id)) torchOn = enabled;
+        }
+    };
+
+    public static boolean isRunning() { return running; }
+
     @Override public void onCreate() {
         super.onCreate();
+        running = true;
         camera = (CameraManager) getSystemService(CAMERA_SERVICE);
         sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
+        if (camera != null) {
+            cameraId = findRearFlashCamera();
+            camera.registerTorchCallback(torchCallback, null);
+        }
         if (sensors != null) {
-            if (Build.VERSION.SDK_INT >= 21) accelerometer = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER, true);
-            if (accelerometer == null) accelerometer = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-            proximity = sensors.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+            motionSensor = sensors.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION, true);
+            if (motionSensor == null) motionSensor = sensors.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION);
+            if (motionSensor != null) {
+                linearAcceleration = true;
+            } else {
+                motionSensor = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER, true);
+                if (motionSensor == null) motionSensor = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            }
+            Sensor proximity = sensors.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+            if (motionSensor != null) sensors.registerListener(this, motionSensor, SensorManager.SENSOR_DELAY_GAME);
+            if (proximity != null) sensors.registerListener(this, proximity, SensorManager.SENSOR_DELAY_NORMAL);
         }
         createChannel();
         startForeground(NOTIFICATION_ID, buildNotification());
-        // 20 ms sampling gives the detector quicker response than the previous 40 ms.
-        if (accelerometer != null) sensors.registerListener(this, accelerometer, 20_000);
-        if (proximity != null) sensors.registerListener(this, proximity, SensorManager.SENSOR_DELAY_NORMAL);
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -71,28 +93,41 @@ public final class TorchService extends Service implements SensorEventListener {
             if (pocketed) resetGesture();
             return;
         }
-        if (event.sensor.getType() != Sensor.TYPE_ACCELEROMETER || event.values.length < 3 || pocketed) return;
+        if (motionSensor == null || event.sensor.getType() != motionSensor.getType()
+                || event.values.length < 3 || pocketed) return;
 
-        final float alpha = 0.82f;
-        if (!gravityReady) {
-            gravityX = event.values[0]; gravityY = event.values[1]; gravityZ = event.values[2];
-            gravityReady = true;
+        float x, y, z;
+        if (linearAcceleration) {
+            x = event.values[0]; y = event.values[1]; z = event.values[2];
+        } else {
+            final float alpha = 0.82f;
+            if (!gravityReady) {
+                gravityX = event.values[0]; gravityY = event.values[1]; gravityZ = event.values[2];
+                gravityReady = true;
+                return;
+            }
+            gravityX = alpha * gravityX + (1f - alpha) * event.values[0];
+            gravityY = alpha * gravityY + (1f - alpha) * event.values[1];
+            gravityZ = alpha * gravityZ + (1f - alpha) * event.values[2];
+            x = event.values[0] - gravityX;
+            y = event.values[1] - gravityY;
+            z = event.values[2] - gravityZ;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+        float magnitude = (float) Math.sqrt(x * x + y * y + z * z);
+        if (magnitude < RELEASE_THRESHOLD) {
+            if (!armed) {
+                if (belowReleaseSince == 0) belowReleaseSince = now;
+                if (now - belowReleaseSince >= 35) armed = true;
+            }
+            if (firstPeakAt != 0 && now - firstPeakAt > MAX_PEAK_GAP_MS) resetGesture();
             return;
         }
-        gravityX = alpha * gravityX + (1f - alpha) * event.values[0];
-        gravityY = alpha * gravityY + (1f - alpha) * event.values[1];
-        gravityZ = alpha * gravityZ + (1f - alpha) * event.values[2];
-        float x = event.values[0] - gravityX;
-        float y = event.values[1] - gravityY;
-        float z = event.values[2] - gravityZ;
-        float magnitude = (float) Math.sqrt(x*x + y*y + z*z);
-        long now = SystemClock.elapsedRealtime();
+        belowReleaseSince = 0;
+        if (magnitude < PEAK_THRESHOLD || !armed) return;
 
-        if (now - lastTriggerAt < COOLDOWN_MS) return;
-        if (magnitude < REARM_THRESHOLD) peakArmed = true;
-        if (magnitude < PEAK_THRESHOLD || !peakArmed) return;
-
-        peakArmed = false;
+        armed = false;
         float nx = x / magnitude, ny = y / magnitude, nz = z / magnitude;
         if (firstPeakAt == 0 || now - firstPeakAt > MAX_PEAK_GAP_MS) {
             storeFirstPeak(now, nx, ny, nz);
@@ -101,71 +136,91 @@ public final class TorchService extends Service implements SensorEventListener {
 
         long gap = now - firstPeakAt;
         float directionDot = nx * firstX + ny * firstY + nz * firstZ;
-        if (gap >= MIN_PEAK_GAP_MS && gap <= MAX_PEAK_GAP_MS && directionDot < -0.20f) {
+        if (gap >= MIN_PEAK_GAP_MS && gap <= MAX_PEAK_GAP_MS
+                && directionDot <= OPPOSITE_DOT_THRESHOLD) {
             resetGesture();
-            lastTriggerAt = now;
-            toggleTorch();
-        } else if (gap > MAX_PEAK_GAP_MS || directionDot >= -0.20f) {
+            if (now - lastTriggerAt >= COOLDOWN_MS) {
+                lastTriggerAt = now;
+                toggleTorch();
+            }
+        } else if (gap > MAX_PEAK_GAP_MS || directionDot > OPPOSITE_DOT_THRESHOLD) {
             storeFirstPeak(now, nx, ny, nz);
         }
     }
 
+    private String findRearFlashCamera() {
+        try {
+            for (String id : camera.getCameraIdList()) {
+                CameraCharacteristics c = camera.getCameraCharacteristics(id);
+                Boolean flash = c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+                Integer facing = c.get(CameraCharacteristics.LENS_FACING);
+                if (Boolean.TRUE.equals(flash)
+                        && (facing == null || facing == CameraCharacteristics.LENS_FACING_BACK)) return id;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Unable to find a flash camera", e);
+        }
+        return null;
+    }
+
     private void storeFirstPeak(long time, float x, float y, float z) {
-        firstPeakAt = time;
-        firstX = x; firstY = y; firstZ = z;
+        firstPeakAt = time; firstX = x; firstY = y; firstZ = z;
     }
 
     private void resetGesture() {
-        firstPeakAt = 0;
-        peakArmed = true;
+        firstPeakAt = 0; armed = true; belowReleaseSince = 0;
     }
 
     private void toggleTorch() { setTorch(!torchOn); }
 
     private void setTorch(boolean enabled) {
-        if (camera == null) return;
+        if (camera == null || cameraId == null) return;
         try {
-            if (cameraId == null) {
-                for (String id : camera.getCameraIdList()) {
-                    android.hardware.camera2.CameraCharacteristics c = camera.getCameraCharacteristics(id);
-                    Boolean flash = c.get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE);
-                    Integer facing = c.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING);
-                    if (Boolean.TRUE.equals(flash) && (facing == null || facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK)) {
-                        cameraId = id;
-                        break;
-                    }
-                }
-            }
-            if (cameraId != null) { camera.setTorchMode(cameraId, enabled); torchOn = enabled; }
-        } catch (Exception ignored) { }
+            camera.setTorchMode(cameraId, enabled);
+            torchOn = enabled;
+        } catch (Exception e) {
+            Log.w(TAG, "Torch change failed", e);
+        }
     }
 
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            NotificationChannel channel = new NotificationChannel(CHANNEL, "Gesture torch", NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Required notification while chop gesture detection is active");
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL, "Gesture torch", NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription("Ongoing notification for chop gesture detection");
             channel.setSound(null, null);
             channel.enableVibration(false);
-            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(channel);
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) manager.createNotificationChannel(channel);
         }
     }
 
     private Notification buildNotification() {
         Intent stop = new Intent(this, TorchService.class).setAction("STOP");
-        PendingIntent pending = PendingIntent.getService(this, 8, stop, PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
-        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
-        return b.setSmallIcon(android.R.drawable.ic_lock_idle_charging)
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
+        PendingIntent pending = PendingIntent.getService(this, 8, stop, flags);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+        return builder.setSmallIcon(android.R.drawable.ic_lock_idle_charging)
                 .setContentTitle("Light gesture active")
                 .setContentText("Double-chop to toggle flashlight")
                 .setOngoing(true).setOnlyAlertOnce(true)
-                .addAction(android.R.drawable.ic_media_pause, "Stop", pending).build();
+                .addAction(android.R.drawable.ic_media_pause, "Stop", pending)
+                .build();
     }
 
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
+
     @Override public void onDestroy() {
+        running = false;
         if (sensors != null) sensors.unregisterListener(this);
+        if (camera != null) {
+            try { camera.unregisterTorchCallback(torchCallback); } catch (Exception ignored) { }
+        }
         setTorch(false);
         super.onDestroy();
     }
+
     @Override public IBinder onBind(Intent intent) { return null; }
 }
