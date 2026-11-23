@@ -55,6 +55,8 @@ public final class TorchService extends Service implements SensorEventListener {
     @Override public void onCreate() {
         super.onCreate();
         running = true;
+        createChannel();
+        startForeground(NOTIFICATION_ID, buildNotification());
         camera = (CameraManager) getSystemService(CAMERA_SERVICE);
         sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
         if (camera != null) {
@@ -74,8 +76,6 @@ public final class TorchService extends Service implements SensorEventListener {
             if (motionSensor != null) sensors.registerListener(this, motionSensor, SensorManager.SENSOR_DELAY_GAME);
             if (proximity != null) sensors.registerListener(this, proximity, SensorManager.SENSOR_DELAY_NORMAL);
         }
-        createChannel();
-        startForeground(NOTIFICATION_ID, buildNotification());
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
